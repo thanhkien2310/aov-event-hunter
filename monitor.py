@@ -33,7 +33,6 @@ def get_url_hash(url_string):
     return hashlib.sha256(url_string.encode()).hexdigest()
 
 def git_sync_general(data, message):
-    """Hàm đồng bộ log chung cho toàn bộ hệ thống"""
     try:
         subprocess.run(["git", "config", "user.name", "AOV-Hunter-Bot"], check=False)
         subprocess.run(["git", "config", "user.email", "bot@github.com"], check=False)
@@ -47,51 +46,32 @@ def git_sync_general(data, message):
     except: return False
 
 def kill_entire_fleet():
-    """Vô hiệu hóa Workflow và hủy tất cả máy ảo đang chạy khác ngay lập tức"""
     print(f"[!!!] NHIỆM VỤ HOÀN TẤT. ĐANG GIẢI TÁN HẠM ĐỘI...")
     try:
-        # 1. Vô hiệu hóa workflow
         subprocess.run(["gh", "workflow", "disable", "AOV Event Monitor"], env={**os.environ, "GH_TOKEN": GH_TOKEN}, check=False)
-        
-        # 2. Hủy các Run song song
         cmd = ["gh", "run", "list", "--workflow", "AOV Event Monitor", "--status", "in_progress", "--json", "databaseId"]
         result = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "GH_TOKEN": GH_TOKEN})
-        
         if result.returncode == 0:
             runs = json.loads(result.stdout)
             for r in runs:
                 other_id = str(r['databaseId'])
                 if other_id != CURRENT_RUN_ID:
-                    print(f"[*] Hủy máy ảo song song ID: {other_id}")
                     subprocess.run(["gh", "run", "cancel", other_id], env={**os.environ, "GH_TOKEN": GH_TOKEN}, check=False)
-        
-        print("[+] Đã dọn dẹp xong. Tắt máy ảo hiện tại.")
         os._exit(0)
-    except:
-        os._exit(0)
+    except: os._exit(0)
 
 def git_lock_and_check(ev_id):
-    """Cơ chế giành quyền đóng gói độc quyền"""
     history = {}
     if os.path.exists(LOG_FILE):
         try:
             with open(LOG_FILE, "r") as f: history = json.load(f)
         except: pass
-    
-    if history.get(ev_id, {}).get("archived"):
-        return False, history
-
-    history[ev_id] = {
-        "status": 200, 
-        "archived": True, 
-        "time": get_vn_now().strftime('%Y-%m-%d %H:%M:%S'), 
-        "by_run": RUN_ID
-    }
-    success = git_sync_general(history, f"Run #{RUN_ID}: Lock and Archive {ev_id}")
-    return success, history
+    if history.get(ev_id, {}).get("archived"): return False, history
+    history[ev_id] = {"status": 200, "archived": True, "time": get_vn_now().strftime('%Y-%m-%d %H:%M:%S'), "by_run": RUN_ID}
+    return git_sync_general(history, f"Run #{RUN_ID}: Lock {ev_id}"), history
 
 def archive_event(url, ev_id):
-    """Bóc tách tài nguyên và gửi Telegram"""
+    """Bóc tách tài nguyên với cơ chế đặt tên API chuyên nghiệp"""
     try:
         from playwright.sync_api import sync_playwright
         if not os.path.exists(ev_id): os.makedirs(ev_id)
@@ -100,40 +80,50 @@ def archive_event(url, ev_id):
             context = browser.new_context(viewport={'width': 375, 'height': 812}, is_mobile=True)
             page = context.new_page()
             res_counter = [0]
+
             def handle_res(res):
                 try:
                     u, ct = res.url, res.headers.get("content-type", "").lower()
                     res_counter[0] += 1
+                    
+                    # Tự động nhận diện tên API từ URL (ví dụ: /api/app/config -> config)
+                    api_name = u.split('/')[-1].split('?')[0] or "graphql"
+                    # Nếu là các tham số dài (/param/rules,config...) thì rút gọn tên
+                    if len(api_name) > 30: api_name = api_name[:25] + "_params"
+
                     if any(x in u.lower() for x in ['api', 'graphql', 'config']) or "json" in ct:
-                        with open(os.path.join(ev_id, f"{res_counter[0]:02d}_api.json"), "w", encoding="utf-8") as f:
+                        # Lưu tệp JSON với định dạng: [Thứ tự]_api_[Tên gốc].json
+                        fname = f"{res_counter[0]:02d}_api_{api_name}.json"
+                        with open(os.path.join(ev_id, fname), "w", encoding="utf-8") as f:
                             json.dump(res.json(), f, indent=4, ensure_ascii=False)
-                    elif any(ext in u.lower() for ext in ['.js', '.css', '.png', '.jpg', '.html']):
-                        fname = u.split('/')[-1].split('?')[0] or f"file_{res_counter[0]}"
-                        with open(os.path.join(ev_id, fname), "wb") as f: f.write(res.body())
+                    
+                    elif any(ext in u.lower() for ext in ['.js', '.css', '.png', '.jpg', '.html', '.woff2']):
+                        # Lưu tệp tĩnh với tên gốc của nó
+                        static_name = u.split('/')[-1].split('?')[0] or f"file_{res_counter[0]}"
+                        with open(os.path.join(ev_id, static_name), "wb") as f:
+                            f.write(res.body())
                 except: pass
+
             page.on("response", handle_res)
             page.goto(url, wait_until="networkidle", timeout=90000)
-            time.sleep(15)
-            with open(os.path.join(ev_id, "rendered_view.html"), "w", encoding="utf-8") as f: f.write(page.content())
-            ss_path = f"{ev_id}.png"
-            page.screenshot(path=ss_path, full_page=True)
+            time.sleep(20) # Chờ render toàn diện
+            
+            with open(os.path.join(ev_id, "00_rendered_view.html"), "w", encoding="utf-8") as f:
+                f.write(page.content())
+            page.screenshot(path=f"{ev_id}.png", full_page=True)
             browser.close()
 
         zip_path = shutil.make_archive(ev_id, 'zip', ev_id)
         vn_time = get_vn_now().strftime('%H:%M:%S %d/%m')
-        caption = f"Ding Dong✨, Sự kiện đã bắt đầu! {ev_id}\n⏰ Lúc: {vn_time}\n🔍 Bởi: Run #{RUN_ID}"
-        
-        with open(ss_path, 'rb') as photo:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data={"chat_id": TG_ID, "caption": caption}, files={'photo': photo})
-        with open(zip_path, 'rb') as doc:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", data={"chat_id": TG_ID}, files={'document': doc})
+        caption = f"Ding Dong✨, Sự kiện đã bắt đầu! {ev_id}\n⏰ Phát hiện: {vn_time}\n🔍 Bởi: Run #{RUN_ID}"
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data={"chat_id": TG_ID, "caption": caption}, files={'photo': open(f"{ev_id}.png", 'rb')})
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", data={"chat_id": TG_ID}, files={'document': open(zip_path, 'rb')})
         return True
     except: return False
 
 def run():
-    print(f"[*] Fleet Commander #{RUN_ID} (System ID: {CURRENT_RUN_ID}) đang trực chiến...")
+    print(f"[*] Fleet Commander #{RUN_ID} đang trực chiến...")
     start_ts = time.time()
-    
     while time.time() - start_ts < 19800:
         history = {}
         if os.path.exists(LOG_FILE):
@@ -141,16 +131,13 @@ def run():
                 with open(LOG_FILE, "r") as f: history = json.load(f)
             except: pass
 
-        # --- AUTO RESET LOG KHI URL THAY ĐỔI (DÙNG HASH ĐỂ BẢO MẬT PUBLIC) ---
+        # AUTO RESET LOG
         current_hash = get_url_hash(URL_RAW)
         if history.get("__metadata__", {}).get("url_hash") != current_hash:
-            print("[!] Phát hiện thay đổi URL Secret. Resetting log...")
             history = {"__metadata__": {"url_hash": current_hash}}
             git_sync_general(history, f"Run #{RUN_ID}: Reset log for new URLs")
 
-        # Lọc danh sách chờ
         pending = [u for u in URL_LIST if not history.get(get_event_id(u), {}).get("archived")]
-
         if not pending and len(URL_LIST) > 0:
             kill_entire_fleet()
             return
@@ -160,25 +147,16 @@ def run():
             try:
                 headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"}
                 res = requests.get(url, timeout=15, allow_redirects=True, headers=headers)
-                
-                print(f"[{get_vn_now().strftime('%H:%M:%S')}] {ev_id} | Status: {res.status_code}")
-
                 if res.status_code == 200 and "/maintenance" not in res.url.lower():
-                    # Thực hiện Lock và Check quyền đóng gói
                     is_winner, history = git_lock_and_check(ev_id)
                     if is_winner:
                         print(f"[!] THẮNG CUỘC! Đang đóng gói {ev_id}...")
                         subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
                         archive_event(url, ev_id)
-                        
-                        # Kiểm tra xem đã hết danh sách chưa
                         if all(history.get(get_event_id(u), {}).get("archived") for u in URL_LIST):
                             kill_entire_fleet()
                             return
-                    else:
-                        print(f"[*] {ev_id} đã được phiên khác xử lý.")
             except: pass
-        
         time.sleep(random.randint(300, 600))
 
 if __name__ == "__main__":
