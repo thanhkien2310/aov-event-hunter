@@ -16,7 +16,7 @@ URL_LIST = [u.strip() for u in URL_RAW.split(',') if u.strip()]
 TG_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TG_ID = os.getenv('TELEGRAM_CHAT_ID')
 RUN_ID = os.getenv('GITHUB_RUN_NUMBER', '0')
-CURRENT_RUN_ID = os.getenv('GITHUB_RUN_ID', '0') # ID định danh của máy ảo hiện tại
+CURRENT_RUN_ID = os.getenv('GITHUB_RUN_ID', '0')
 LOG_FILE = "history.json"
 GH_TOKEN = os.getenv('GH_TOKEN')
 
@@ -32,56 +32,66 @@ def get_event_id(url):
 def get_url_hash(url_string):
     return hashlib.sha256(url_string.encode()).hexdigest()
 
-def kill_fleet():
-    """Lệnh tối thượng: Vô hiệu hóa Workflow và Hủy toàn bộ các máy ảo đang chạy khác"""
-    print(f"[!!!] SỰ KIỆN HOÀN TẤT. ĐANG THỰC THI LỆNH TRUY SÁT TOÀN HỆ THỐNG...")
-    try:
-        # 1. Tắt vĩnh viễn Workflow
-        subprocess.run(["gh", "workflow", "disable", "AOV Event Monitor"], env={**os.environ, "GH_TOKEN": GH_TOKEN}, check=False)
-        
-        # 2. Lấy danh sách tất cả các phiên đang chạy (in_progress)
-        cmd_list = ["gh", "run", "list", "--workflow", "AOV Event Monitor", "--status", "in_progress", "--json", "databaseId"]
-        result = subprocess.run(cmd_list, capture_output=True, text=True, env={**os.environ, "GH_TOKEN": GH_TOKEN})
-        
-        if result.returncode == 0:
-            runs = json.loads(result.stdout)
-            for run in runs:
-                other_run_id = str(run['databaseId'])
-                if other_run_id != CURRENT_RUN_ID:
-                    print(f"[*] Đang hủy máy ảo song song: {other_run_id}")
-                    subprocess.run(["gh", "run", "cancel", other_run_id], env={**os.environ, "GH_TOKEN": GH_TOKEN}, check=False)
-        
-        print("[+] Đã dọn dẹp xong. Tạm biệt!")
-        os._exit(0) # Đóng máy ảo hiện tại ngay lập tức
-    except Exception as e:
-        print(f"Lỗi khi thực thi lệnh hủy: {e}")
-        os._exit(0)
-
-def git_lock_and_check(ev_id):
-    """Cơ chế khóa để giành quyền đóng gói"""
+def git_sync_general(data, message):
+    """Hàm đồng bộ log chung cho toàn bộ hệ thống"""
     try:
         subprocess.run(["git", "config", "user.name", "AOV-Hunter-Bot"], check=False)
         subprocess.run(["git", "config", "user.email", "bot@github.com"], check=False)
         subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
-        
-        history = {}
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "r") as f: history = json.load(f)
-        
-        if history.get(ev_id, {}).get("archived") is True:
-            return False, history
-
-        history[ev_id] = {"status": 200, "archived": True, "time": get_vn_now().strftime('%Y-%m-%d %H:%M:%S'), "locked_by": RUN_ID}
-        with open(LOG_FILE, "w", encoding="utf-8") as f: json.dump(history, f, indent=4)
-        
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
         subprocess.run(["git", "add", LOG_FILE], check=False)
-        subprocess.run(["git", "commit", "-m", f"Run #{RUN_ID}: Lock {ev_id}"], check=False)
+        subprocess.run(["git", "commit", "-m", message], check=False)
         push = subprocess.run(["git", "push"], capture_output=True)
-        return (push.returncode == 0), history
-    except: return False, {}
+        return push.returncode == 0
+    except: return False
+
+def kill_entire_fleet():
+    """Vô hiệu hóa Workflow và hủy tất cả máy ảo đang chạy khác ngay lập tức"""
+    print(f"[!!!] NHIỆM VỤ HOÀN TẤT. ĐANG GIẢI TÁN HẠM ĐỘI...")
+    try:
+        # 1. Vô hiệu hóa workflow
+        subprocess.run(["gh", "workflow", "disable", "AOV Event Monitor"], env={**os.environ, "GH_TOKEN": GH_TOKEN}, check=False)
+        
+        # 2. Hủy các Run song song
+        cmd = ["gh", "run", "list", "--workflow", "AOV Event Monitor", "--status", "in_progress", "--json", "databaseId"]
+        result = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "GH_TOKEN": GH_TOKEN})
+        
+        if result.returncode == 0:
+            runs = json.loads(result.stdout)
+            for r in runs:
+                other_id = str(r['databaseId'])
+                if other_id != CURRENT_RUN_ID:
+                    print(f"[*] Hủy máy ảo song song ID: {other_id}")
+                    subprocess.run(["gh", "run", "cancel", other_id], env={**os.environ, "GH_TOKEN": GH_TOKEN}, check=False)
+        
+        print("[+] Đã dọn dẹp xong. Tắt máy ảo hiện tại.")
+        os._exit(0)
+    except:
+        os._exit(0)
+
+def git_lock_and_check(ev_id):
+    """Cơ chế giành quyền đóng gói độc quyền"""
+    history = {}
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, "r") as f: history = json.load(f)
+        except: pass
+    
+    if history.get(ev_id, {}).get("archived"):
+        return False, history
+
+    history[ev_id] = {
+        "status": 200, 
+        "archived": True, 
+        "time": get_vn_now().strftime('%Y-%m-%d %H:%M:%S'), 
+        "by_run": RUN_ID
+    }
+    success = git_sync_general(history, f"Run #{RUN_ID}: Lock and Archive {ev_id}")
+    return success, history
 
 def archive_event(url, ev_id):
-    """Đóng gói và gửi báo cáo"""
+    """Bóc tách tài nguyên và gửi Telegram"""
     try:
         from playwright.sync_api import sync_playwright
         if not os.path.exists(ev_id): os.makedirs(ev_id)
@@ -102,21 +112,26 @@ def archive_event(url, ev_id):
                         with open(os.path.join(ev_id, fname), "wb") as f: f.write(res.body())
                 except: pass
             page.on("response", handle_res)
-            page.goto(url, wait_until="networkidle", timeout=60000)
+            page.goto(url, wait_until="networkidle", timeout=90000)
             time.sleep(15)
             with open(os.path.join(ev_id, "rendered_view.html"), "w", encoding="utf-8") as f: f.write(page.content())
-            page.screenshot(path=f"{ev_id}.png", full_page=True)
+            ss_path = f"{ev_id}.png"
+            page.screenshot(path=ss_path, full_page=True)
             browser.close()
+
         zip_path = shutil.make_archive(ev_id, 'zip', ev_id)
         vn_time = get_vn_now().strftime('%H:%M:%S %d/%m')
-        caption = f"Ding Dong✨, Sự kiện đã bắt đầu! {ev_id}\n⏰ Phát hiện: {vn_time}\n🔍 Bởi: Run #{RUN_ID}"
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data={"chat_id": TG_ID, "caption": caption}, files={'photo': open(f"{ev_id}.png", 'rb')})
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", data={"chat_id": TG_ID}, files={'document': open(zip_path, 'rb')})
+        caption = f"Ding Dong✨, Sự kiện đã bắt đầu! {ev_id}\n⏰ Lúc: {vn_time}\n🔍 Bởi: Run #{RUN_ID}"
+        
+        with open(ss_path, 'rb') as photo:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data={"chat_id": TG_ID, "caption": caption}, files={'photo': photo})
+        with open(zip_path, 'rb') as doc:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", data={"chat_id": TG_ID}, files={'document': doc})
         return True
     except: return False
 
 def run():
-    print(f"[*] Phiên làm việc #{RUN_ID} (System ID: {CURRENT_RUN_ID}) đang trực chiến...")
+    print(f"[*] Fleet Commander #{RUN_ID} (System ID: {CURRENT_RUN_ID}) đang trực chiến...")
     start_ts = time.time()
     
     while time.time() - start_ts < 19800:
@@ -126,14 +141,18 @@ def run():
                 with open(LOG_FILE, "r") as f: history = json.load(f)
             except: pass
 
-        if history.get("__metadata__", {}).get("url_hash") != get_url_hash(URL_RAW):
-            history = {"__metadata__": {"url_hash": get_url_hash(URL_RAW)}}
-            with open(LOG_FILE, "w") as f: json.dump(history, f)
+        # --- AUTO RESET LOG KHI URL THAY ĐỔI (DÙNG HASH ĐỂ BẢO MẬT PUBLIC) ---
+        current_hash = get_url_hash(URL_RAW)
+        if history.get("__metadata__", {}).get("url_hash") != current_hash:
+            print("[!] Phát hiện thay đổi URL Secret. Resetting log...")
+            history = {"__metadata__": {"url_hash": current_hash}}
+            git_sync_general(history, f"Run #{RUN_ID}: Reset log for new URLs")
 
+        # Lọc danh sách chờ
         pending = [u for u in URL_LIST if not history.get(get_event_id(u), {}).get("archived")]
 
         if not pending and len(URL_LIST) > 0:
-            kill_fleet()
+            kill_entire_fleet()
             return
 
         for url in pending:
@@ -141,16 +160,23 @@ def run():
             try:
                 headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"}
                 res = requests.get(url, timeout=15, allow_redirects=True, headers=headers)
+                
+                print(f"[{get_vn_now().strftime('%H:%M:%S')}] {ev_id} | Status: {res.status_code}")
+
                 if res.status_code == 200 and "/maintenance" not in res.url.lower():
+                    # Thực hiện Lock và Check quyền đóng gói
                     is_winner, history = git_lock_and_check(ev_id)
                     if is_winner:
-                        print(f"[!] THẮNG CUỘC! Run #{RUN_ID} thực thi đóng gói.")
+                        print(f"[!] THẮNG CUỘC! Đang đóng gói {ev_id}...")
                         subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
                         archive_event(url, ev_id)
-                        # Kiểm tra lại sau khi đóng gói
+                        
+                        # Kiểm tra xem đã hết danh sách chưa
                         if all(history.get(get_event_id(u), {}).get("archived") for u in URL_LIST):
-                            kill_fleet()
+                            kill_entire_fleet()
                             return
+                    else:
+                        print(f"[*] {ev_id} đã được phiên khác xử lý.")
             except: pass
         
         time.sleep(random.randint(300, 600))
