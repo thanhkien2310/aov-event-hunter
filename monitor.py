@@ -72,89 +72,108 @@ def git_lock_and_check(ev_id):
     return git_sync_general(history, f"Run #{RUN_ID}: Lock {ev_id}"), history
 
 def archive_event(url, ev_id):
-    """Hàm thu thập toàn bộ tài nguyên Network (Full Asset Capture)"""
+    """Hàm thu thập tài nguyên chuẩn hóa (Fix lỗi định dạng file)"""
     try:
         from playwright.sync_api import sync_playwright
-        if os.path.exists(ev_id): shutil.rmtree(ev_id)
-        os.makedirs(ev_id)
+        # Dọn dẹp tuyệt đối thư mục cũ trước khi bắt đầu
+        if os.path.exists(ev_id): shutil.rmtree(ev_id, ignore_errors=True)
+        os.makedirs(ev_id, exist_ok=True)
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            # Giả lập thiết bị di động để load tài nguyên chuẩn Mobile
-            context = browser.new_context(viewport={'width': 375, 'height': 812}, is_mobile=True, user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15")
+            context = browser.new_context(
+                viewport={'width': 375, 'height': 812}, 
+                is_mobile=True,
+                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
+            )
             page = context.new_page()
-            
             res_counter = [0]
 
             def handle_res(res):
                 try:
-                    res_counter[0] += 1
                     u = res.url
-                    # Bỏ qua các tracking/ads bên ngoài nếu cần, hoặc lấy hết
                     if "google-analytics" in u or "doubleclick" in u: return
-
-                    ct = res.headers.get("content-type", "").lower()
-                    # Lấy tên file từ URL hoặc hash nếu không có tên
-                    parsed_u = urlparse(u)
-                    fname = parsed_u.path.split('/')[-1] or "index.html"
-                    # Loại bỏ query string trong tên file
-                    fname = fname.split('?')[0]
-                    # Đánh số thứ tự để giữ đúng trình tự load trong Network tab
-                    save_name = f"{res_counter[0]:03d}_{fname}"
-
-                    # 1. Xử lý tài nguyên dạng Text (JSON, JS, CSS, HTML)
-                    if any(x in ct for x in ["json", "javascript", "css", "html", "text"]):
-                        body = res.text()
-                        with open(os.path.join(ev_id, save_name), "w", encoding="utf-8") as f:
-                            # Nếu là JSON thì format đẹp, còn lại lưu thô
-                            if "json" in ct:
-                                try: json.dump(res.json(), f, indent=4, ensure_ascii=False)
-                                except: f.write(body)
-                            else:
-                                f.write(body)
                     
-                    # 2. Xử lý tài nguyên dạng Binary (Ảnh, Font, Media)
-                    elif any(x in ct for x in ["image", "font", "video", "octet-stream"]):
-                        body = res.body()
-                        with open(os.path.join(ev_id, save_name), "wb") as f:
-                            f.write(body)
+                    res_counter[0] += 1
+                    ct = res.headers.get("content-type", "").lower()
+                    
+                    # Lấy tên tệp sạch sẽ
+                    parsed_u = urlparse(u)
+                    raw_fname = parsed_u.path.split('/')[-1] or "index"
+                    clean_fname = raw_fname.split('?')[0].split('#')[0]
+                    
+                    # Đánh số thứ tự và đảm bảo tên tệp hợp lệ
+                    save_name = f"{res_counter[0]:03d}_{clean_fname}"
+                    
+                    # Gán phần mở rộng nếu thiếu dựa trên content-type
+                    if "javascript" in ct and not save_name.endswith(".js"): save_name += ".js"
+                    elif "css" in ct and not save_name.endswith(".css"): save_name += ".css"
+                    elif "json" in ct and not save_name.endswith(".json"): save_name += ".json"
+                    elif "image" in ct and "." not in clean_fname: save_name += ".png"
+
+                    # GIẢI PHÁP QUAN TRỌNG: Luôn lấy Body dạng Bytes để chống hỏng định dạng
+                    raw_data = res.body()
+                    
+                    file_path = os.path.join(ev_id, save_name)
+                    
+                    # Xử lý đặc biệt cho JSON để dễ đọc (Pretty Print)
+                    if "json" in ct:
+                        try:
+                            json_obj = json.loads(raw_data.decode('utf-8'))
+                            with open(file_path, "w", encoding="utf-8") as f:
+                                json.dump(json_obj, f, indent=4, ensure_ascii=False)
+                        except:
+                            # Nếu decode lỗi, lưu thô nhị phân luôn
+                            with open(file_path, "wb") as f: f.write(raw_data)
+                    else:
+                        # CSS, JS, Ảnh... lưu dạng nhị phân nguyên bản (wb)
+                        with open(file_path, "wb") as f:
+                            f.write(raw_data)
                 except:
                     pass
 
             page.on("response", handle_res)
-            # Tăng timeout lên 90s và đợi mạng rảnh (networkidle) để tải hết ảnh/css
+            # Dùng wait_until="networkidle" để đảm bảo load hết CSS/JS ngoại vi
             page.goto(url, wait_until="networkidle", timeout=90000)
-            time.sleep(15) # Chờ thêm để chắc chắn các API lười (lazy load) đã chạy
+            time.sleep(10)
 
-            rendered_content = page.content()
-            if is_fake_200(rendered_content):
+            final_html = page.content()
+            if is_fake_200(final_html):
                 browser.close()
                 return "MAINTENANCE"
 
-            # Lưu ảnh chụp và mã nguồn render cuối cùng
+            # Lưu ảnh và file render cuối
             page.screenshot(path=f"{ev_id}.png", full_page=True)
-            with open(os.path.join(ev_id, "000_FULL_RENDERED.html"), "w", encoding="utf-8") as f:
-                f.write(rendered_content)
+            with open(os.path.join(ev_id, "000_DOM_RENDERED.html"), "w", encoding="utf-8") as f:
+                f.write(final_html)
             
             browser.close()
 
-        # Đóng gói toàn bộ thư mục
-        zip_path = shutil.make_archive(ev_id, 'zip', ev_id)
-        caption = f"🚀 FULL ASSET CAPTURED: {ev_id}\n⏰ {get_vn_now().strftime('%H:%M:%S %d/%m')}\n🔍 Run #{RUN_ID}"
+        # Đóng gói ZIP: Chỉ đóng gói thư mục ev_id hiện tại
+        # Sử dụng base_name và root_dir rõ ràng để tránh đóng gói thừa thư mục cha
+        shutil.make_archive(ev_id, 'zip', root_dir=ev_id)
+        zip_file = f"{ev_id}.zip"
         
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data={"chat_id": TG_ID, "caption": caption}, files={'photo': open(f"{ev_id}.png", 'rb')})
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", data={"chat_id": TG_ID}, files={'document': open(zip_path, 'rb')})
+        vn_time = get_vn_now().strftime('%H:%M:%S %d/%m')
+        caption = f"✅ ĐÃ ĐÓNG GÓI SỰ KIỆN: {ev_id}\n⏰ {vn_time}\n🔍 Node: Run #{RUN_ID}"
         
-        # Dọn dẹp
-        shutil.rmtree(ev_id)
+        # Gửi Telegram
+        with open(f"{ev_id}.png", 'rb') as photo:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data={"chat_id": TG_ID, "caption": caption}, files={'photo': photo})
+        with open(zip_file, 'rb') as doc:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", data={"chat_id": TG_ID}, files={'document': doc})
+        
+        # Dọn dẹp rác ngay sau khi gửi thành công
+        shutil.rmtree(ev_id, ignore_errors=True)
         if os.path.exists(f"{ev_id}.png"): os.remove(f"{ev_id}.png")
+        if os.path.exists(zip_file): os.remove(zip_file)
         return True
     except Exception as e:
-        print(f"Archive Error: {e}")
+        print(f"Archive Error {ev_id}: {e}")
         return False
 
 def run():
-    print(f"[*] Fleet Commander #{RUN_ID} (Full Asset Mode) online.")
+    print(f"[*] Fleet Commander #{RUN_ID} (High Fidelity Mode) online.")
     subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
     
     start_ts = time.time()
@@ -169,9 +188,9 @@ def run():
         is_url_changed = history.get("__metadata__", {}).get("url_hash") != current_hash
 
         if is_url_changed:
-            print("[!] PHÁT HIỆN THAY ĐỔI URL -> QUÉT NGAY.")
+            print("[!] URL THAY ĐỔI -> RESET LOG.")
             history = {"__metadata__": {"url_hash": current_hash}}
-            git_sync_general(history, f"Run #{RUN_ID}: New URL list")
+            git_sync_general(history, f"Run #{RUN_ID}: Update URL hash")
 
         pending = [u for u in URL_LIST if not history.get(get_event_id(u), {}).get("archived")]
         if not pending and len(URL_LIST) > 0:
@@ -180,20 +199,21 @@ def run():
 
         for url in pending:
             ev_id = get_event_id(url)
-            print(f"[{get_vn_now().strftime('%H:%M:%S')}] Checking: {ev_id}")
+            print(f"[{get_vn_now().strftime('%H:%M:%S')}] Quét: {ev_id}")
             try:
-                res = requests.get(url, timeout=20)
+                res = requests.get(url, timeout=20, allow_redirects=True)
                 if res.status_code == 200 and not is_fake_200(res.text):
                     is_winner, history = git_lock_and_check(ev_id)
                     if is_winner:
                         result = archive_event(url, ev_id)
                         if result == "MAINTENANCE":
                             history[ev_id]["archived"] = False
-                            git_sync_general(history, f"Run #{RUN_ID}: Unlock {ev_id}")
+                            git_sync_general(history, f"Run #{RUN_ID}: Unlock {ev_id} (Still Maint)")
                         elif result:
                             if all(history.get(get_event_id(u), {}).get("archived") for u in URL_LIST):
                                 kill_entire_fleet()
-            except: pass
+            except Exception as e:
+                print(f"Check Error {ev_id}: {e}")
 
         if is_url_changed:
             is_url_changed = False
