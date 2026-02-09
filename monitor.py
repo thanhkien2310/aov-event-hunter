@@ -56,10 +56,31 @@ def git_sync_general(data, message):
     except: return False
 
 def kill_entire_fleet():
+    """Giải tán hạm đội: Tắt workflow và hủy tất cả các Run đang chạy"""
+    print(f"[!!!] NHIỆM VỤ HOÀN TẤT. ĐANG GIẢI TÁN HẠM ĐỘI...")
+    # Tăng cường env để gh hoạt động ổn định
+    gh_env = {**os.environ, "GH_TOKEN": GH_TOKEN}
     try:
-        subprocess.run(["gh", "workflow", "disable", "AOV Event Monitor"], env={**os.environ, "GH_TOKEN": GH_TOKEN}, check=False)
+        # Vô hiệu hóa workflow để không có Run mới sinh ra
+        subprocess.run(["gh", "workflow", "disable", "AOV Event Monitor"], env=gh_env, check=False)
+        
+        # Tìm danh sách các run đang 'in_progress'
+        cmd = ["gh", "run", "list", "--workflow", "AOV Event Monitor", "--status", "in_progress", "--json", "databaseId"]
+        result = subprocess.run(cmd, capture_output=True, text=True, env=gh_env)
+        
+        if result.returncode == 0:
+            runs = json.loads(result.stdout)
+            for r in runs:
+                rid = str(r['databaseId'])
+                if rid != CURRENT_RUN_ID:
+                    print(f"[*] Đang hủy máy ảo treo: {rid}")
+                    subprocess.run(["gh", "run", "cancel", rid], env=gh_env, check=False)
+        
+        print("[*] Hạm đội đã giải tán. Tự hủy máy ảo hiện tại...")
         os._exit(0)
-    except: os._exit(0)
+    except Exception as e:
+        print(f"Lỗi khi giải tán: {e}")
+        os._exit(0)
 
 def git_lock_and_check(ev_id):
     history = {}
@@ -67,103 +88,78 @@ def git_lock_and_check(ev_id):
         try:
             with open(LOG_FILE, "r", encoding="utf-8") as f: history = json.load(f)
         except: pass
+    
     if history.get(ev_id, {}).get("archived"): return False, history
-    history[ev_id] = {"status": 200, "archived": True, "time": get_vn_now().strftime('%Y-%m-%d %H:%M:%S'), "by_run": RUN_ID}
+    
+    history[ev_id] = {
+        "status": 200, 
+        "archived": True, 
+        "time": get_vn_now().strftime('%Y-%m-%d %H:%M:%S'), 
+        "by_run": RUN_ID
+    }
     return git_sync_general(history, f"Run #{RUN_ID}: Lock {ev_id}"), history
 
 def archive_event(url, ev_id):
-    """Hàm thu thập tài nguyên chuẩn hóa (Fix lỗi định dạng file)"""
     try:
         from playwright.sync_api import sync_playwright
-        # Dọn dẹp tuyệt đối thư mục cũ trước khi bắt đầu
         if os.path.exists(ev_id): shutil.rmtree(ev_id, ignore_errors=True)
         os.makedirs(ev_id, exist_ok=True)
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                viewport={'width': 375, 'height': 812}, 
-                is_mobile=True,
-                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"
-            )
+            context = browser.new_context(viewport={'width': 375, 'height': 812}, is_mobile=True)
             page = context.new_page()
             res_counter = [0]
 
             def handle_res(res):
                 try:
                     u = res.url
-                    if "google-analytics" in u or "doubleclick" in u: return
-                    
+                    if any(x in u for x in ["google", "analytics", "facebook"]): return
                     res_counter[0] += 1
                     ct = res.headers.get("content-type", "").lower()
-                    
-                    # Lấy tên tệp sạch sẽ
                     parsed_u = urlparse(u)
-                    raw_fname = parsed_u.path.split('/')[-1] or "index"
-                    clean_fname = raw_fname.split('?')[0].split('#')[0]
-                    
-                    # Đánh số thứ tự và đảm bảo tên tệp hợp lệ
+                    clean_fname = (parsed_u.path.split('/')[-1] or "index").split('?')[0]
                     save_name = f"{res_counter[0]:03d}_{clean_fname}"
                     
-                    # Gán phần mở rộng nếu thiếu dựa trên content-type
                     if "javascript" in ct and not save_name.endswith(".js"): save_name += ".js"
                     elif "css" in ct and not save_name.endswith(".css"): save_name += ".css"
                     elif "json" in ct and not save_name.endswith(".json"): save_name += ".json"
-                    elif "image" in ct and "." not in clean_fname: save_name += ".png"
 
-                    # GIẢI PHÁP QUAN TRỌNG: Luôn lấy Body dạng Bytes để chống hỏng định dạng
                     raw_data = res.body()
-                    
                     file_path = os.path.join(ev_id, save_name)
-                    
-                    # Xử lý đặc biệt cho JSON để dễ đọc (Pretty Print)
+
                     if "json" in ct:
                         try:
-                            json_obj = json.loads(raw_data.decode('utf-8'))
                             with open(file_path, "w", encoding="utf-8") as f:
-                                json.dump(json_obj, f, indent=4, ensure_ascii=False)
+                                json.dump(json.loads(raw_data.decode('utf-8')), f, indent=4, ensure_ascii=False)
                         except:
-                            # Nếu decode lỗi, lưu thô nhị phân luôn
                             with open(file_path, "wb") as f: f.write(raw_data)
                     else:
-                        # CSS, JS, Ảnh... lưu dạng nhị phân nguyên bản (wb)
-                        with open(file_path, "wb") as f:
-                            f.write(raw_data)
-                except:
-                    pass
+                        with open(file_path, "wb") as f: f.write(raw_data)
+                except: pass
 
             page.on("response", handle_res)
-            # Dùng wait_until="networkidle" để đảm bảo load hết CSS/JS ngoại vi
             page.goto(url, wait_until="networkidle", timeout=90000)
-            time.sleep(10)
+            time.sleep(12)
 
-            final_html = page.content()
-            if is_fake_200(final_html):
+            if is_fake_200(page.content()):
                 browser.close()
                 return "MAINTENANCE"
 
-            # Lưu ảnh và file render cuối
             page.screenshot(path=f"{ev_id}.png", full_page=True)
-            with open(os.path.join(ev_id, "000_DOM_RENDERED.html"), "w", encoding="utf-8") as f:
-                f.write(final_html)
-            
+            with open(os.path.join(ev_id, "000_DOM_SOURCE.html"), "w", encoding="utf-8") as f:
+                f.write(page.content())
             browser.close()
 
-        # Đóng gói ZIP: Chỉ đóng gói thư mục ev_id hiện tại
-        # Sử dụng base_name và root_dir rõ ràng để tránh đóng gói thừa thư mục cha
         shutil.make_archive(ev_id, 'zip', root_dir=ev_id)
         zip_file = f"{ev_id}.zip"
+        caption = f"✅ ĐÃ ĐÓNG GÓI: {ev_id}\n⏰ {get_vn_now().strftime('%H:%M:%S %d/%m')}\n🔍 Node: Run #{RUN_ID}"
         
-        vn_time = get_vn_now().strftime('%H:%M:%S %d/%m')
-        caption = f"✅ ĐÃ ĐÓNG GÓI SỰ KIỆN: {ev_id}\n⏰ {vn_time}\n🔍 Node: Run #{RUN_ID}"
-        
-        # Gửi Telegram
         with open(f"{ev_id}.png", 'rb') as photo:
             requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data={"chat_id": TG_ID, "caption": caption}, files={'photo': photo})
         with open(zip_file, 'rb') as doc:
             requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument", data={"chat_id": TG_ID}, files={'document': doc})
         
-        # Dọn dẹp rác ngay sau khi gửi thành công
         shutil.rmtree(ev_id, ignore_errors=True)
         if os.path.exists(f"{ev_id}.png"): os.remove(f"{ev_id}.png")
         if os.path.exists(zip_file): os.remove(zip_file)
@@ -173,7 +169,7 @@ def archive_event(url, ev_id):
         return False
 
 def run():
-    print(f"[*] Fleet Commander #{RUN_ID} (High Fidelity Mode) online.")
+    print(f"[*] Fleet Commander #{RUN_ID} chuẩn bị trực chiến...")
     subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
     
     start_ts = time.time()
@@ -184,42 +180,50 @@ def run():
                 with open(LOG_FILE, "r", encoding="utf-8") as f: history = json.load(f)
             except: pass
 
+        # --- TÍNH NĂNG ƯU TIÊN KHI ĐỔI URL ---
         current_hash = get_url_hash(URL_RAW)
         is_url_changed = history.get("__metadata__", {}).get("url_hash") != current_hash
 
         if is_url_changed:
-            print("[!] URL THAY ĐỔI -> RESET LOG.")
+            print("[!] URL THAY ĐỔI -> RESET LOG ĐỂ QUÉT ƯU TIÊN.")
             history = {"__metadata__": {"url_hash": current_hash}}
-            git_sync_general(history, f"Run #{RUN_ID}: Update URL hash")
+            git_sync_general(history, f"Run #{RUN_ID}: URL reset detected")
 
+        # Tìm các URL chưa được lưu trữ
         pending = [u for u in URL_LIST if not history.get(get_event_id(u), {}).get("archived")]
+        
+        # Nếu không còn gì để quét, dọn hạm đội rồi nghỉ
         if not pending and len(URL_LIST) > 0:
             kill_entire_fleet()
             return
 
+        # QUAN TRỌNG: Duyệt hết danh sách trước khi check kill hạm đội
         for url in pending:
             ev_id = get_event_id(url)
-            print(f"[{get_vn_now().strftime('%H:%M:%S')}] Quét: {ev_id}")
+            print(f"[{get_vn_now().strftime('%H:%M:%S')}] Kiểm tra: {ev_id}")
             try:
+                # Dùng requests check thô trước để tiết kiệm tài nguyên
                 res = requests.get(url, timeout=20, allow_redirects=True)
                 if res.status_code == 200 and not is_fake_200(res.text):
                     is_winner, history = git_lock_and_check(ev_id)
                     if is_winner:
+                        # Thực hiện đóng gói
                         result = archive_event(url, ev_id)
                         if result == "MAINTENANCE":
+                            # Mở khóa nếu nhầm trang bảo trì giả
                             history[ev_id]["archived"] = False
-                            git_sync_general(history, f"Run #{RUN_ID}: Unlock {ev_id} (Still Maint)")
-                        elif result:
-                            if all(history.get(get_event_id(u), {}).get("archived") for u in URL_LIST):
-                                kill_entire_fleet()
+                            git_sync_general(history, f"Run #{RUN_ID}: Unlock {ev_id}")
             except Exception as e:
                 print(f"Check Error {ev_id}: {e}")
 
+        # Quay lại kiểm tra xem sau vòng lặp này đã xong hết chưa
         if is_url_changed:
             is_url_changed = False
             continue
             
-        time.sleep(random.randint(300, 600))
+        wait = random.randint(300, 600)
+        print(f"[*] Nghỉ {wait}s...")
+        time.sleep(wait)
 
 if __name__ == "__main__":
     run()
