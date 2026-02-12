@@ -207,53 +207,76 @@ def archive_event(url, ev_id):
 
 # ================= RUN LOOP =================
 def run():
-    print(f"[*] Fleet Predator #{RUN_ID} Start...")
-    # Cài đặt Playwright
+    print(f"[*] Fleet Predator #{RUN_ID} (System ID: {CURRENT_RUN_ID}) trực chiến...")
+    
+    # Cài đặt môi trường (Chỉ làm 1 lần khi bật máy)
     subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
-    if shutil.which("npx"): # Kiểm tra npx theo review
+    if shutil.which("npx"):
         subprocess.run(["npx", "playwright", "install-deps", "chromium"], check=False)
-
+    
     start_ts = time.time()
+    
     while time.time() - start_ts < 19800:
+        # --- BƯỚC 1: ĐỒNG BỘ NHẬT KÝ MỚI NHẤT ---
+        # Ép buộc pull từ GitHub để biết các phiên khác đã làm gì
+        subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
+        
         history = {}
         if os.path.exists(LOG_FILE):
             try:
                 with open(LOG_FILE, "r") as f: history = json.load(f)
-            except: pass
+            except: history = {}
 
-        # --- URGENT REFRESH LOGIC ---
+        # --- BƯỚC 2: KIỂM TRA BIẾN URL THAY ĐỔI ---
         current_hash = get_url_hash(URL_RAW)
-        if history.get("__metadata__", {}).get("url_hash") != current_hash:
-            print("[!!!] CONFIG CHANGE -> RESET LOG")
-            cleanup_older_runs()
+        last_hash = history.get("__metadata__", {}).get("url_hash")
+        
+        if last_hash and last_hash != current_hash:
+            # Trường hợp này xảy ra khi bạn đổi Secret và một Run mới đã cập nhật Hash vào file
+            # Máy ảo hiện tại (đang mang URL cũ) phải tự hủy để nhường chỗ
+            print("[!] Cấu hình đã thay đổi bởi phiên khác. Tự hủy để tránh quét sai mục tiêu...")
+            sys.exit(0)
+        
+        if not last_hash or last_hash != current_hash:
+            # Trường hợp này phiên này là phiên đầu tiên nhận ra sự thay đổi
+            print("[!!!] PHÁT HIỆN THAY ĐỔI CẤU HÌNH. ĐANG RESET HỆ THỐNG...")
+            cleanup_older_runs() # Hủy hạm đội mang cấu hình cũ
             history = {"__metadata__": {"url_hash": current_hash}}
-            git_sync_general(history, "Config Reset")
-            continue 
-
+            git_sync_general(history, "Global Config Reset")
+            # Tiếp tục quét ngay lập tức với URL mới
+        
+        # --- BƯỚC 3: LỌC DANH SÁCH CHỜ ---
         pending = [u for u in URL_LIST if not history.get(get_event_id(u), {}).get("archived")]
+        
         if not pending and len(URL_LIST) > 0:
+            print("[*] Không còn mục tiêu. Giải tán hạm đội...")
             kill_entire_fleet()
             return
 
+        # --- BƯỚC 4: THỰC THI QUÉT ---
         for url in pending:
             ev_id = get_event_id(url)
-            res = safe_get(url) # Dùng safe_get có retry
+            res = safe_get(url)
             if res and res.status_code == 200:
-                print(f"[*] {ev_id} -> 200 OK. Kiểm tra quyền...")
+                print(f"[*] {ev_id} -> 200 OK. Đang giành quyền...")
                 is_winner, history = git_lock_and_check(ev_id)
                 if is_winner:
                     result = archive_event(url, ev_id)
                     if result == "MAINTENANCE":
+                        # Nhả khóa (Unlock) nếu render ra là trang bảo trì
                         history[ev_id]["archived"] = False
-                        git_sync_general(history, f"Unlock {ev_id} (Fake 200)")
+                        git_sync_general(history, f"Unlock {ev_id} (Maintenance Detected)")
                     elif result:
+                        # Kiểm tra lại xem đã hoàn thành toàn bộ chưa
                         if all(history.get(get_event_id(u), {}).get("archived") for u in URL_LIST):
                             kill_entire_fleet()
                             return
-        
-        wait = random.randint(300, 600)
-        print(f"[{get_vn_now().strftime('%H:%M:%S')}] Rình rập... Nghỉ {wait}s")
-        time.sleep(wait)
+            else:
+                p_vn = get_vn_now().strftime('%H:%M:%S')
+                st = res.status_code if res else "Error"
+                print(f"[{p_vn}] {ev_id} | Status: {st}")
 
-if __name__ == "__main__":
-    run()
+        # Nghỉ ngơi ngẫu nhiên
+        wait = random.randint(300, 600)
+        print(f"[*] Đang trực chiến {len(pending)} mục tiêu. Nghỉ {wait}s...")
+        time.sleep(wait)
