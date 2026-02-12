@@ -13,7 +13,6 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 # ================= SYSTEM SETUP =================
-# Ép Terminal hiển thị Tiếng Việt chuẩn trên Windows
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
@@ -27,15 +26,8 @@ CURRENT_RUN_ID = os.getenv('GITHUB_RUN_ID', '0')
 LOG_FILE = "history.json"
 GH_TOKEN = os.getenv('GH_TOKEN')
 
-MAINTENANCE_KEYWORDS = [
-    "under maintenance", "system maintenance", "bảo trì", 
-    "tạm đóng", "đang cập nhật", "come back later", "quay lại sau"
-]
-
-REAL_OPEN_HINTS = [
-    "webpack", "bundle.js", "vue", "react", "vite", 
-    "nuxt", "astro", "window.__INITIAL_STATE__", "__NUXT__", "__NEXT__"
-]
+MAINTENANCE_KEYWORDS = ["under maintenance", "system maintenance", "bảo trì", "tạm đóng", "đang cập nhật", "come back later"]
+REAL_OPEN_HINTS = ["webpack", "bundle.js", "vue", "react", "vite", "nuxt", "window.__INITIAL_STATE__"]
 
 # ================= UTILS =================
 def get_vn_now():
@@ -51,48 +43,29 @@ def get_url_hash(url_string):
     return hashlib.sha256(url_string.encode()).hexdigest()
 
 def safe_get(url, retry=3):
-    """Thực hiện request với cơ chế thử lại (Retry)"""
     headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"}
     for i in range(retry):
         try:
             res = requests.get(url, timeout=20, allow_redirects=True, headers=headers)
             return res
-        except Exception as e:
-            print(f"[*] Lỗi kết nối lần {i+1}: {e}")
+        except:
             time.sleep(3)
     return None
 
 def is_fake_200(html_content):
-    """Xác minh thông minh sau khi Render"""
+    """Xác minh thông minh sau khi Render (Ngưỡng 400 bytes)"""
     if not html_content: return True
     content_lower = html_content.lower()
-
-    # 1. Kiểm tra từ khóa bảo trì chắc chắn
-    if any(key in content_lower for key in MAINTENANCE_KEYWORDS):
-        return True
-    
-    # 2. Kiểm tra dấu hiệu Framework (SPA) -> Ưu tiên là trang thật
-    if any(hint in content_lower for hint in REAL_OPEN_HINTS):
-        return False
-
-    # 3. Ngưỡng độ dài tối thiểu (120 byte theo review)
-    if len(html_content) < 120:
-        return True
-
+    if any(key in content_lower for key in MAINTENANCE_KEYWORDS): return True
+    if any(hint in content_lower for hint in REAL_OPEN_HINTS): return False
+    if len(html_content) < 400: return True # Hạ ngưỡng xuống 400 theo review
     return False
-
-def send_tg_safe(method, payload, files=None):
-    """Gửi Telegram an toàn, không làm sập tiến trình chính"""
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
-    try:
-        r = requests.post(url, data=payload, files=files, timeout=30)
-        return r.status_code == 200
-    except Exception as e:
-        print(f"[!] Telegram Error: {e}")
-        return False
 
 # ================= FLEET & GIT CONTROL =================
 def git_sync_general(data, message):
+    if not data or "__metadata__" not in data:
+        print("[!] Data rỗng, hủy sync để tránh hỏng file log.")
+        return False
     try:
         subprocess.run(["git", "config", "user.name", "AOV-Hunter-Bot"], check=False)
         subprocess.run(["git", "config", "user.email", "bot@github.com"], check=False)
@@ -106,7 +79,7 @@ def git_sync_general(data, message):
     except: return False
 
 def cleanup_older_runs():
-    print(f"[*] Đang dọn dẹp hạm đội máy ảo song song...")
+    print(f"[*] Đang trảm các máy ảo song song cũ...")
     gh_env = {**os.environ, "GH_TOKEN": GH_TOKEN}
     try:
         cmd = ["gh", "run", "list", "--workflow", "AOV Event Monitor", "--status", "in_progress", "--json", "databaseId"]
@@ -119,16 +92,15 @@ def cleanup_older_runs():
     except: pass
 
 def kill_entire_fleet():
-    print(f"[!!!] NHIỆM VỤ HOÀN TẤT. TẮT HỆ THỐNG.")
+    print(f"[!!!] NHIỆM VỤ HOÀN TẤT. GIẢI TÁN HẠM ĐỘI.")
     gh_env = {**os.environ, "GH_TOKEN": GH_TOKEN}
     try:
         subprocess.run(["gh", "workflow", "disable", "AOV Event Monitor"], env=gh_env, check=False)
         cleanup_older_runs()
     except: pass
-    sys.exit(0)
+    os._exit(0)
 
 def git_lock_and_check(ev_id):
-    """KHÓA NGUYÊN TỬ: Đảm bảo duy nhất 1 phiên xử lý"""
     try:
         subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
         history = {}
@@ -147,12 +119,9 @@ def archive_event(url, ev_id):
         from playwright.sync_api import sync_playwright
         if os.path.exists(ev_id): shutil.rmtree(ev_id, ignore_errors=True)
         os.makedirs(ev_id, exist_ok=True)
-
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            # Random Viewport theo review
-            v_port = random.choice([{'width': 375, 'height': 812}, {'width': 1366, 'height': 768}])
-            context = browser.new_context(viewport=v_port, is_mobile=(v_port['width'] < 500))
+            context = browser.new_context(viewport={'width': 375, 'height': 812}, is_mobile=True)
             page = context.new_page()
             res_counter = [0]
 
@@ -161,11 +130,10 @@ def archive_event(url, ev_id):
                     u, ct = res.url, res.headers.get("content-type", "").lower()
                     if any(x in u for x in ["google", "analytics", "facebook"]): return
                     res_counter[0] += 1
-                    name = u.split('/')[-1].split('?')[0] or "index"
-                    
+                    name = u.split('/')[-1].split('?')[0] or "data"
                     if "json" in ct or any(x in u.lower() for x in ['api', 'graphql', 'config']):
                         try: data = res.json()
-                        except: data = {"raw": res.text()[:5000]} # Sửa lỗi crash JSON
+                        except: data = {"raw": res.text()[:2000]}
                         fname = f"{res_counter[0]:02d}_api_{name}.json"
                         with open(os.path.join(ev_id, fname), "w", encoding="utf-8") as f:
                             json.dump(data, f, indent=4, ensure_ascii=False)
@@ -176,107 +144,100 @@ def archive_event(url, ev_id):
 
             page.on("response", handle_res)
             page.goto(url, wait_until="networkidle", timeout=90000)
-            page.wait_for_timeout(10000) # Tối ưu render theo review
+            page.wait_for_timeout(10000)
             
             final_content = page.content()
             if is_fake_200(final_content):
-                print(f"[!] {ev_id} vẫn là bảo trì.")
                 browser.close()
                 return "MAINTENANCE"
 
-            with open(os.path.join(ev_id, "00_rendered.html"), "w", encoding="utf-8") as f: f.write(final_content)
+            with open(os.path.join(ev_id, "00_rendered.html"), "w", encoding="utf-8") as f:
+                f.write(final_content)
             page.screenshot(path=f"{ev_id}.png", full_page=True)
             browser.close()
 
         zip_path = shutil.make_archive(ev_id, 'zip', ev_id)
         caption = f"✅ SỰ KIỆN MỞ THẬT: {ev_id}\n⏰ {get_vn_now().strftime('%H:%M:%S %d/%m')}\n🔍 Node #{RUN_ID}"
         
-        # Gửi Telegram an toàn
-        send_tg_safe("sendPhoto", {"chat_id": TG_ID, "caption": caption}, {"photo": open(f"{ev_id}.png", 'rb')})
-        send_tg_safe("sendDocument", {"chat_id": TG_ID}, {"document": open(f"{ev_id}.zip", 'rb')})
+        # Telegram send (Safe)
+        tg_url = f"https://api.telegram.org/bot{TG_TOKEN}/"
+        try:
+            with open(f"{ev_id}.png", 'rb') as f: requests.post(tg_url+"sendPhoto", data={"chat_id": TG_ID, "caption": caption}, files={'photo': f})
+            with open(f"{ev_id}.zip", 'rb') as f: requests.post(tg_url+"sendDocument", data={"chat_id": TG_ID}, files={'document': f})
+        except: print("Telegram failed")
         
         return True
     except Exception as e:
-        print(f"[!] Archive Error: {e}"); return False
+        print(f"Archive Error: {e}"); return False
     finally:
-        # Cleanup file tạm theo review
         shutil.rmtree(ev_id, ignore_errors=True)
         for ext in [".png", ".zip"]:
-            fpath = f"{ev_id}{ext}"
-            if os.path.exists(fpath): os.remove(fpath)
+            if os.path.exists(f"{ev_id}{ext}"): os.remove(f"{ev_id}{ext}")
 
 # ================= RUN LOOP =================
 def run():
-    print(f"[*] Fleet Predator #{RUN_ID} (System ID: {CURRENT_RUN_ID}) trực chiến...")
+    print(f"=== FLEET COMMANDER #{RUN_ID} (DEBUG MODE) ===")
+    print(f"[*] URL Count: {len(URL_LIST)}")
+    print(f"[*] Telegram Setup: {'OK' if TG_TOKEN and TG_ID else 'FAIL'}")
     
-    # Cài đặt môi trường (Chỉ làm 1 lần khi bật máy)
+    if not URL_LIST:
+        print("[FATAL] EVENT_URL rỗng. Kiểm tra GitHub Secrets!")
+        kill_entire_fleet() # Tắt luôn vì không có gì để làm
+
     subprocess.run(["python", "-m", "playwright", "install", "chromium"], check=True)
     if shutil.which("npx"):
         subprocess.run(["npx", "playwright", "install-deps", "chromium"], check=False)
-    
+
     start_ts = time.time()
-    
     while time.time() - start_ts < 19800:
-        # --- BƯỚC 1: ĐỒNG BỘ NHẬT KÝ MỚI NHẤT ---
-        # Ép buộc pull từ GitHub để biết các phiên khác đã làm gì
         subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
-        
         history = {}
         if os.path.exists(LOG_FILE):
             try:
                 with open(LOG_FILE, "r") as f: history = json.load(f)
             except: history = {}
 
-        # --- BƯỚC 2: KIỂM TRA BIẾN URL THAY ĐỔI ---
         current_hash = get_url_hash(URL_RAW)
         last_hash = history.get("__metadata__", {}).get("url_hash")
         
-        if last_hash and last_hash != current_hash:
-            # Trường hợp này xảy ra khi bạn đổi Secret và một Run mới đã cập nhật Hash vào file
-            # Máy ảo hiện tại (đang mang URL cũ) phải tự hủy để nhường chỗ
-            print("[!] Cấu hình đã thay đổi bởi phiên khác. Tự hủy để tránh quét sai mục tiêu...")
-            sys.exit(0)
-        
-        if not last_hash or last_hash != current_hash:
-            # Trường hợp này phiên này là phiên đầu tiên nhận ra sự thay đổi
-            print("[!!!] PHÁT HIỆN THAY ĐỔI CẤU HÌNH. ĐANG RESET HỆ THỐNG...")
-            cleanup_older_runs() # Hủy hạm đội mang cấu hình cũ
+        # Sửa logic Init vs Reset
+        if not last_hash:
+            print("[*] Khởi tạo tệp lịch sử mới...")
+            history["__metadata__"] = {"url_hash": current_hash}
+            git_sync_general(history, "Init Config")
+        elif last_hash != current_hash:
+            print("[!!!] CẤU HÌNH THAY ĐỔI -> REBOOT")
+            cleanup_older_runs()
             history = {"__metadata__": {"url_hash": current_hash}}
-            git_sync_general(history, "Global Config Reset")
-            # Tiếp tục quét ngay lập tức với URL mới
-        
-        # --- BƯỚC 3: LỌC DANH SÁCH CHỜ ---
+            git_sync_general(history, "Config Reset")
+            continue 
+
         pending = [u for u in URL_LIST if not history.get(get_event_id(u), {}).get("archived")]
-        
         if not pending and len(URL_LIST) > 0:
-            print("[*] Không còn mục tiêu. Giải tán hạm đội...")
             kill_entire_fleet()
             return
 
-        # --- BƯỚC 4: THỰC THI QUÉT ---
         for url in pending:
             ev_id = get_event_id(url)
             res = safe_get(url)
             if res and res.status_code == 200:
-                print(f"[*] {ev_id} -> 200 OK. Đang giành quyền...")
+                print(f"[*] {ev_id} báo 200 OK. Đang bóc tách...")
                 is_winner, history = git_lock_and_check(ev_id)
                 if is_winner:
                     result = archive_event(url, ev_id)
                     if result == "MAINTENANCE":
-                        # Nhả khóa (Unlock) nếu render ra là trang bảo trì
                         history[ev_id]["archived"] = False
-                        git_sync_general(history, f"Unlock {ev_id} (Maintenance Detected)")
+                        git_sync_general(history, f"Unlock {ev_id}")
                     elif result:
-                        # Kiểm tra lại xem đã hoàn thành toàn bộ chưa
                         if all(history.get(get_event_id(u), {}).get("archived") for u in URL_LIST):
                             kill_entire_fleet()
                             return
             else:
-                p_vn = get_vn_now().strftime('%H:%M:%S')
-                st = res.status_code if res else "Error"
-                print(f"[{p_vn}] {ev_id} | Status: {st}")
+                st = res.status_code if res else "FAIL"
+                print(f"[{get_vn_now().strftime('%H:%M:%S')}] {ev_id} | Status: {st}")
 
-        # Nghỉ ngơi ngẫu nhiên
         wait = random.randint(300, 600)
-        print(f"[*] Đang trực chiến {len(pending)} mục tiêu. Nghỉ {wait}s...")
         time.sleep(wait)
+
+if __name__ == "__main__":
+    run()
