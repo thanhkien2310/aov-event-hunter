@@ -7,5 +7,11 @@
         "archived": true,
         "time": "2026-02-12 22:40:18",
         "run": "62"
+    },
+    "chess-event": {
+        "status": 200,
+        "archived": true,
+        "time": "2026-02-13 10:40:44",
+        "run": "68"
     }
 }
